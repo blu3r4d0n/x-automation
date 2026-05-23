@@ -29,6 +29,8 @@ This repository solves that by mapping a Python backend directly to X's internal
 - **Dynamic Session Extraction:** Auto-scrapes X's JavaScript bundles on startup to find the latest GraphQL `queryId` and `featureSwitches`.
 - **Resilient Scrape Retry Logic:** Failed bundle scrapes back off for 60 seconds before retrying — prevents retry storms on restricted networks (e.g. Render free tier).
 - **Advanced Header Management:** Dynamically generates `x-client-transaction-id` and maintains a stable `x-client-uuid` per session.
+- **Media Uploads:** Attach images by URL (`/tweet`) or by uploading local files directly (`/tweet-file`). Up to 4 images per tweet.
+- **Alt Text Support:** Set accessibility alt text on each image via `mediaAlt` (JSON) or `alt` (multipart) fields.
 - **Actionable Error Handling:** Cleans up ambiguous X API errors into readable flags (`AUTH_EXPIRED`, `RATE_LIMIT`, `DUPLICATE_TWEET`, `AUTOMATION_DETECTED`).
 - **n8n / Make Friendly:** Perfect for triggering from any workflow automation tool via a simple POST request.
 
@@ -83,20 +85,69 @@ uvicorn execution.main:app --host 0.0.0.0 --port 8000
 All mutating endpoints require your `API_KEY` to be passed in the `x-api-key` header.
 
 ### `POST /tweet`
-Post a tweet to the authenticated account.
-**Request:**
+Post a tweet with optional image attachments by URL.
+
+**Body fields:**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | Tweet content, max 280 chars |
+| `mediaUrls` | list of strings | no | Public image URLs to attach (up to 4) |
+| `mediaAlt` | list of strings | no | Alt text for each image, positionally matched to `mediaUrls` |
+
+**Text only:**
 ```bash
 curl -X POST http://localhost:8000/tweet \
   -H "x-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello world from the unofficial API!"}'
 ```
+
+**With images and alt text:**
+```bash
+curl -X POST http://localhost:8000/tweet \
+  -H "x-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Check this out!",
+    "mediaUrls": ["https://example.com/photo.jpg"],
+    "mediaAlt": ["A description of the photo"]
+  }'
+```
+
 **Response:**
 ```json
 {
   "success": true,
   "tweet_id": "184719247192847120"
 }
+```
+
+### `POST /tweet-file`
+Post a tweet with local file uploads via `multipart/form-data`. Useful when calling from scripts that already have image bytes in memory.
+
+**Form fields:**
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | Tweet content, max 280 chars |
+| `files` | file | no | Image file(s) to attach (repeat for multiple, up to 4) |
+| `alt` | string | no | Alt text per image, repeat in the same order as `files` |
+
+```bash
+# Single image with alt text
+curl -X POST http://localhost:8000/tweet-file \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "text=Hello with a local file!" \
+  -F "files=@/path/to/photo.jpg" \
+  -F "alt=A description of the photo"
+
+# Multiple images
+curl -X POST http://localhost:8000/tweet-file \
+  -H "x-api-key: YOUR_API_KEY" \
+  -F "text=Two photos!" \
+  -F "files=@photo1.jpg" \
+  -F "files=@photo2.png" \
+  -F "alt=Description of first photo" \
+  -F "alt=Description of second photo"
 ```
 
 ### `GET /health`
@@ -145,7 +196,7 @@ To use this with n8n:
 As mentioned, this toolkit is a little complex underneath the hood! If you're running a business and love this automation but:
 - Don't know how to deploy it
 - Keep getting flagged or proxy-banned
-- Need custom functionality (Media uploads, DMs, thread scheduling)
+- Need custom functionality (DMs, thread scheduling, advanced workflows)
 
 Reach out to us. **[Product Siddha](https://productsiddha.com)** specializes in building robust, un-breakable automation infrastructure for growing businesses.
 

@@ -1,17 +1,28 @@
 # Directive: Post Tweet via X Automation Service
 
 ## Goal
-Expose a single HTTP endpoint that accepts a tweet payload and posts it to X (Twitter).
+Expose HTTP endpoints that accept tweet payloads and post them to X (Twitter), with support for image attachments (by URL or file upload) and alt text.
 
 ## Inputs
-- `POST /tweet` with JSON body:
-  - `text` (string, required): Tweet content, max 280 chars
-  - `mediaUrls` (list of strings, optional): Public image URLs to attach
+
+### `POST /tweet` — JSON body
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | Tweet content, max 280 chars |
+| `mediaUrls` | list of strings | no | Public image URLs to attach (up to 4) |
+| `mediaAlt` | list of strings | no | Alt text per image, positionally matched to `mediaUrls` |
+
+### `POST /tweet-file` — multipart/form-data
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | Tweet content, max 280 chars |
+| `files` | file | no | Image file(s) to attach — repeat field for multiple (up to 4) |
+| `alt` | string | no | Alt text per image — repeat in the same order as `files` |
 
 ## Outputs
 - `200 OK`: `{ "success": true, "tweet_id": "<id>" }`
 - `401 Unauthorized`: Missing or wrong API key
-- `500 Internal Server Error`: `{ "success": false, "error": "<reason>" }`
+- `200 OK` (error): `{ "success": false, "error": "<reason>" }` — X errors are returned as 200 with `success: false`
 
 ## Tools / Scripts
 - `execution/main.py` — The FastAPI app. Run with: `uvicorn execution.main:app --host 0.0.0.0 --port 8000`
@@ -50,12 +61,15 @@ This service is designed to run on any platform that supports Python (Render, Ra
 ## Endpoints
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/tweet` | `x-api-key` header | Post a tweet |
+| `POST` | `/tweet` | `x-api-key` header | Post a tweet (JSON, images by URL) |
+| `POST` | `/tweet-file` | `x-api-key` header | Post a tweet (multipart, local file uploads) |
 | `GET` | `/health` | none | Status: queryId source, features source, cache age. Reads from cache only — does NOT trigger a scrape. Safe for high-frequency keep-alive pings. |
 | `GET` | `/ip` | none | Outbound IP (verify proxy is routing correctly) |
 | `GET` | `/debug-tweet` | `x-api-key` header | Post a test tweet and return full raw X API response |
 
-## Test Command
+## Test Commands
+
+**Text only:**
 ```bash
 curl -X POST https://your-service-url/tweet \
   -H "x-api-key: $API_KEY" \
@@ -63,10 +77,27 @@ curl -X POST https://your-service-url/tweet \
   -d '{"text":"Hello from X Automation!"}'
 ```
 
+**With image URL and alt text:**
+```bash
+curl -X POST https://your-service-url/tweet \
+  -H "x-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Check this out!", "mediaUrls":["https://example.com/photo.jpg"], "mediaAlt":["A description of the photo"]}'
+```
+
+**With local file upload:**
+```bash
+curl -X POST https://your-service-url/tweet-file \
+  -H "x-api-key: $API_KEY" \
+  -F "text=Hello with a local file!" \
+  -F "files=@/path/to/photo.jpg" \
+  -F "alt=A description of the photo"
+```
+
 ## n8n Integration Example
 - HTTP Request node → `POST https://your-service-url/tweet`
 - Header: `x-api-key: <your API_KEY>`
-- Body (JSON): `{ "text": "{{$json.tweet_text}}", "mediaUrls": [] }`
+- Body (JSON): `{ "text": "{{$json.tweet_text}}", "mediaUrls": [], "mediaAlt": [] }`
 - Timeout: **60 seconds** (cold start protection on free-tier hosts)
 - Retry: **2 attempts**, **5000ms** between
 - Keep-alive: Schedule Trigger node every 14 min → `GET /health` to prevent cold starts

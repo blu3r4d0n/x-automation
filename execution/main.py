@@ -25,8 +25,10 @@ import time
 import uuid
 
 from bs4 import BeautifulSoup
+from curl_cffi import CurlMime
 from curl_cffi.requests import AsyncSession
-from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi import FastAPI, HTTPException, Security, Depends, UploadFile, File, Form
+from typing import Annotated
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -264,12 +266,11 @@ def verify_api_key(key: str = Security(api_key_header)):
     return key
 
 
-def _build_headers(method: str = "POST", path: str = "") -> dict:
+def _build_headers(method: str = "POST", path: str = "", content_type: str | None = "application/json") -> dict:
     headers = {
         "authorization": f"Bearer {BEARER}",
         "cookie": f"auth_token={AUTH_TOKEN}; ct0={CT0}",
         "x-csrf-token": CT0,
-        "content-type": "application/json",
         "x-twitter-active-user": "yes",
         "x-twitter-auth-type": "OAuth2Session",
         "x-twitter-client-language": "en",
@@ -282,6 +283,8 @@ def _build_headers(method: str = "POST", path: str = "") -> dict:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
     }
+    if content_type is not None:
+        headers["content-type"] = content_type
 
     # Generate x-client-transaction-id if we have the context
     if _transaction_ctx and method and path:
@@ -349,6 +352,7 @@ def _classify_error(data: dict, status_code: int) -> str:
 class TweetRequest(BaseModel):
     text: str
     mediaUrls: list[str] = []
+    mediaAlt: list[str] = []  # positional alt text for each mediaUrl; empty string = no alt
 
 
 class TweetResponse(BaseModel):
@@ -357,13 +361,56 @@ class TweetResponse(BaseModel):
     error: str | None = None
 
 
-async def _attempt_tweet(text: str, query_id: str) -> dict:
+async def _upload_media_bytes(data: bytes, mime: str, alt_text: str | None = None) -> str:
+    """Upload raw bytes to X's media endpoint. Returns media_id_string."""
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    mp = CurlMime()
+    mp.addpart(name="media", data=data, content_type=mime)
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
+        upload_resp = await session.post(
+            "https://upload.twitter.com/1.1/media/upload.json",
+            headers=_build_headers(content_type=None),
+            multipart=mp,
+            timeout=60,
+        )
+        if upload_resp.status_code != 200:
+            raise RuntimeError(f"Media upload failed ({upload_resp.status_code}): {upload_resp.text[:200]}")
+        media_id = upload_resp.json()["media_id_string"]
+
+        if alt_text:
+            meta_body = json.dumps({"media_id": media_id, "alt_text": {"text": alt_text}}).encode()
+            meta_resp = await session.post(
+                "https://upload.twitter.com/1.1/media/metadata/create.json",
+                headers=_build_headers(),
+                data=meta_body,
+                timeout=15,
+            )
+            if meta_resp.status_code in (200, 204):
+                log.info(f"Alt text set for media_id {media_id}")
+            else:
+                log.warning(f"Alt text set failed ({meta_resp.status_code}): {meta_resp.text[:500]}")
+
+    return media_id
+
+
+async def _upload_media(url: str, alt_text: str | None = None) -> str:
+    """Fetch an image from url and upload it to X. Returns media_id_string."""
+    proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
+    async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
+        img_resp = await session.get(url, timeout=15)
+        if img_resp.status_code != 200:
+            raise RuntimeError(f"Failed to fetch media ({img_resp.status_code}): {url}")
+        mime = img_resp.headers.get("content-type", "image/jpeg").split(";")[0]
+    return await _upload_media_bytes(img_resp.content, mime, alt_text=alt_text)
+
+
+async def _attempt_tweet(text: str, query_id: str, media_ids: list[str] | None = None) -> dict:
     """Fire a single CreateTweet request. Returns raw parsed JSON."""
     path = f"/i/api/graphql/{query_id}/CreateTweet"
     url = f"https://x.com{path}"
     proxies = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
     async with AsyncSession(impersonate=BROWSER, proxies=proxies) as session:
-        body = _build_tweet_payload(text, query_id)
+        body = _build_tweet_payload(text, query_id, media_ids=media_ids)
         resp = await session.post(
             url, headers=_build_headers(method="POST", path=path), json=body, timeout=30
         )
@@ -383,9 +430,22 @@ def _extract_tweet_id(data: dict) -> str | None:
 @app.post("/tweet", response_model=TweetResponse)
 async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
     try:
+        # Upload media first (once — reused on retry)
+        media_ids: list[str] | None = None
+        if payload.mediaUrls:
+            try:
+                alts = payload.mediaAlt + [""] * len(payload.mediaUrls)
+                media_ids = [
+                    await _upload_media(u, alt_text=a or None)
+                    for u, a in zip(payload.mediaUrls, alts)
+                ]
+                log.info(f"Uploaded {len(media_ids)} media item(s): {media_ids}")
+            except Exception as exc:
+                return TweetResponse(success=False, error=f"MEDIA_UPLOAD_ERROR: {exc}")
+
         # Attempt 1: use cached queryId
         query_id = await _get_create_tweet_id()
-        result = await _attempt_tweet(payload.text, query_id)
+        result = await _attempt_tweet(payload.text, query_id, media_ids=media_ids)
         data = result["data"]
         status = result["status_code"]
 
@@ -411,7 +471,7 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         new_query_id = await _get_create_tweet_id(force_refresh=True)
 
         log.info(f"queryId: {query_id} → {new_query_id}. Retrying...")
-        result = await _attempt_tweet(payload.text, new_query_id)
+        result = await _attempt_tweet(payload.text, new_query_id, media_ids=media_ids)
         data = result["data"]
         status = result["status_code"]
 
@@ -433,6 +493,80 @@ async def post_tweet(payload: TweetRequest, _: str = Depends(verify_api_key)):
         return TweetResponse(
             success=False,
             error=f"EMPTY_RESULT: Tweet may have been silently rejected (rate-limit, duplicate, or account restriction). Response: {json.dumps(data)}",
+        )
+
+    except Exception as exc:
+        error_str = str(exc)
+        if "proxy" in error_str.lower() or "connect" in error_str.lower():
+            return TweetResponse(success=False, error=f"PROXY_ERROR: {error_str}")
+        return TweetResponse(success=False, error=error_str)
+
+
+@app.post("/tweet-file", response_model=TweetResponse)
+async def post_tweet_with_file(
+    text: Annotated[str, Form()],
+    _: Annotated[str, Depends(verify_api_key)],
+    files: Annotated[list[UploadFile], File()] = [],
+    alt: Annotated[list[str], Form()] = [],
+):
+    """Post a tweet with local file attachments via multipart/form-data."""
+    try:
+        media_ids: list[str] | None = None
+        if files:
+            try:
+                alts = alt + [""] * len(files)
+                ids = []
+                for f, a in zip(files, alts):
+                    data = await f.read()
+                    mime = f.content_type or "image/jpeg"
+                    ids.append(await _upload_media_bytes(data, mime, alt_text=a or None))
+                    log.info(f"Uploaded file '{f.filename}' → media_id {ids[-1]}")
+                media_ids = ids
+            except Exception as exc:
+                return TweetResponse(success=False, error=f"MEDIA_UPLOAD_ERROR: {exc}")
+
+        query_id = await _get_create_tweet_id()
+        result = await _attempt_tweet(text, query_id, media_ids=media_ids)
+        data = result["data"]
+        status = result["status_code"]
+
+        if status != 200:
+            err = _classify_error(data, status) or f"X API {status}: {json.dumps(data)}"
+            return TweetResponse(success=False, error=err)
+
+        tweet_id = _extract_tweet_id(data)
+        if tweet_id:
+            return TweetResponse(success=True, tweet_id=tweet_id)
+
+        if "errors" in data:
+            err = _classify_error(data, status)
+            if err.startswith("DUPLICATE_TWEET"):
+                return TweetResponse(success=True, tweet_id=None)
+            return TweetResponse(success=False, error=err)
+
+        log.warning("Empty tweet_results on file tweet. Refreshing queryId and retrying...")
+        new_query_id = await _get_create_tweet_id(force_refresh=True)
+        result = await _attempt_tweet(text, new_query_id, media_ids=media_ids)
+        data = result["data"]
+        status = result["status_code"]
+
+        if status != 200:
+            err = _classify_error(data, status) or f"X API {status}: {json.dumps(data)}"
+            return TweetResponse(success=False, error=err)
+
+        tweet_id = _extract_tweet_id(data)
+        if tweet_id:
+            return TweetResponse(success=True, tweet_id=tweet_id)
+
+        if "errors" in data:
+            err = _classify_error(data, status)
+            if err.startswith("DUPLICATE_TWEET"):
+                return TweetResponse(success=True, tweet_id=None)
+            return TweetResponse(success=False, error=err)
+
+        return TweetResponse(
+            success=False,
+            error=f"EMPTY_RESULT: Tweet may have been silently rejected. Response: {json.dumps(data)}",
         )
 
     except Exception as exc:
